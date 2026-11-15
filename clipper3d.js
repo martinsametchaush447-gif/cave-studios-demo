@@ -591,7 +591,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       }
       cam.el = Math.max(lim.elMin, Math.min(lim.elMax, cam.el));
       // idle sway: a slow additive turn that fades in after 4 s without input, folded into az on the next touch
-      const idleOK = !reduced && reg.idleSway !== false && !dragging && !cam.tw && state.mode === 'assembled' && now - lastInput > 4000;
+      const idleOK = !reduced && reg.idleSway !== false && !dragging && !cam.tw && state.mode === 'assembled' && now - lastInput > 4000 && now - lastInput < 24000;
       cam.swayAmp += ((idleOK ? 1 : 0) - cam.swayAmp) * Math.min(1, dt * 0.6);
       if (cam.swayAmp > 0.001) { cam.sway = Math.sin((now - lastInput - 4000) / 1000 * 0.45) * 0.32 * cam.swayAmp; moving = true; }
       placeCamera();
@@ -655,7 +655,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
         if (L.gr.anchor) { tmpV.x += L.gr.anchor[0]; tmpV.y += L.gr.anchor[1]; tmpV.z += L.gr.anchor[2]; }
         const v = tmpV.project(camera);
         L.sx = (v.x * 0.5 + 0.5) * W; L.sy = (-v.y * 0.5 + 0.5) * H;
-        const side = state.mode === 'lifted' ? (L.sx > W * 0.55 ? 'L' : 'R') : (L.gr.side || (L.sx < W / 2 ? 'L' : 'R'));
+        const side = state.mode === 'lifted' ? (L.sx > W * 0.55 ? 'L' : 'R') : (L.sx < (resize.l || 0) + Wf / 2 ? 'L' : 'R');   /* side from where the part really is: leader lines never cross */
         L.side = side; L.y = L.sy - L.h / 2;
         if (state.mode === 'lifted') { L.rpx = (L.rad || 0.1) * (Hf / 2) / (L.dist * tanH); L.y = L.sy - L.rpx * 0.8 - L.h; }
         sides[side].push(L);
@@ -751,7 +751,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       }
     }
     canvas.addEventListener('pointerup', up); canvas.addEventListener('pointercancel', up);
-    canvas.addEventListener('wheel', (e) => { e.preventDefault(); touchStart(); cam.zoom = Math.max(lim.zoomMin, Math.min(lim.zoomMax, cam.zoom * Math.exp(e.deltaY * 0.0012))); }, { passive: false });
+    canvas.addEventListener('wheel', (e) => { if (!e.ctrlKey) return; e.preventDefault(); touchStart(); cam.zoom = Math.max(lim.zoomMin, Math.min(lim.zoomMax, cam.zoom * Math.exp(e.deltaY * 0.0012))); }, { passive: false });
     function pick(e) {
       const r = canvas.getBoundingClientRect(); // once per tap, not per frame
       ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
@@ -759,10 +759,10 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       const hit = ray.intersectObjects(pickables, false)[0]; if (!hit) return;
       const gr = groupOfPart(hit.object.userData.partId); if (gr) select(gr.id);
     }
-    g.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !document.documentElement.classList.contains('sheet-open') && visible) reset(); });
+    g.addEventListener('keydown', (e) => { if (e.target && e.target.closest && e.target.closest('input,textarea,select')) return; if (e.key === 'Escape' && !document.documentElement.classList.contains('sheet-open') && visible) reset(); });
 
     // ---------- loop, visibility, adaptive DPR ----------
-    let dirty = true, running = false, visible = true, last = performance.now(), slow = 0, frames = 0;
+    let held = false, dirty = true, running = false, visible = true, last = performance.now(), slow = 0, frames = 0;
     function frame(now) {
       const dt = Math.min(0.05, (now - last) / 1000); last = now; dbg.frames++;
       const a = stepParts(now), m = stepCamera(dt, now);
@@ -777,7 +777,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       if (frames >= 120) { if (slow > 60 && dpr > 1 && dbg.dprDrops < 3) { dbg.dprDrops++; resize.t = -1; resize(); } frames = 0; slow = 0; }
     }
     function setRunning() {
-      const want = visible && !document.hidden && !dbg.lost;
+      const want = visible && !document.hidden && !dbg.lost && !held;
       if (want === running) return; running = want; last = performance.now();
       renderer.setAnimationLoop(want ? frame : null);
     }
@@ -798,7 +798,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       lift: (id) => { if (!(state.mode === 'lifted' && state.group === id)) select(id); },
       setPose: (p, d) => { setPose(typeof p === 'string' ? reg[p] : p, d); lastInput = performance.now() + 8000; dirty = true; },
       orbit: (daz, del) => { foldSway(); cam.az += daz; cam.el += del || 0; dirty = true; },
-      kick: () => { dirty = true; }, frameHook: null,
+      kick: () => { dirty = true; }, frameHook: null, hold: (on) => { held = !!on; setRunning(); },
       busy: () => !!cam.tw || [...parts.values()].some((P) => P.tw) || Math.abs(cam.vAz) > 1e-3,
       info: () => ({ calls: renderer.info.render.calls, tris: renderer.info.render.triangles, geos: renderer.info.memory.geometries, tex: renderer.info.memory.textures, dpr, W, H }),
       renderer, scene, camera, registry: reg,
@@ -883,7 +883,8 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     // Upper body: short shell under the head + the core sleeve the grip band slides over.
     const upMesh = mesh(K.lathe(K.shellProfile(R, Y_GRIP, Y_UP, { fillet: 0.001 }), SEG, OV), M.body);
     const sleeve = mesh(K.lathe(K.filletPath([[R - 0.03, Y_LOW - 0.005], [R - 0.024, Y_LOW - 0.005, 0.004], [R - 0.024, Y_GRIP + 0.004], [R - 0.04, Y_GRIP + 0.004], [R - 0.04, Y_LOW - 0.005], [R - 0.03, Y_LOW - 0.005]], 3), SEG, OV), M.inner);
-    sleeve.userData.hiddenAtRest = true;
+    // 15 Nov: NOT hidden at rest any more. It is the inner collar behind the two 4 mm seams above and below the grip
+    // band; hidden, the seams were see-through all round the body (turntable gate, GATES.md).
     add('upper', [upMesh, sleeve], { exploded: { p: [0, 0.14, 0] } });
 
     // Grip band: knurled ring with polished chamfer rings at both ends.
