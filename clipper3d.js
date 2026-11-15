@@ -407,6 +407,173 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     return gr;
   };
 
+  // ---------- sliceable heavy helpers (cave-studios round 29) ----------
+  // Same algorithms and output order as before (checked byte for byte against the old build), written as generators
+  // that yield every few thousand steps, so a caller can spread one big call over several idle slices.
+  // The plain K.tessellate / K.smooth / K.wrapOval run the same generator to the end in one go.
+  const drain = (it) => { let r; while (!(r = it.next()).done); return r.value; };
+  K.drain = drain;
+  const STEP = 3000;
+  K.tessellateG = function* (geo, maxEdge) {
+    if (geo.index) geo = geo.toNonIndexed();
+    const src = geo.attributes.position.array, uvA = geo.attributes.uv ? geo.attributes.uv.array : null;
+    const m2 = maxEdge * maxEdge, nt = src.length / 9;
+    let st = new Float64Array(Math.max(1024, nt * 15 * 2)), sp = 0;          // stack of triangles, 15 numbers each
+    for (let i = 0; i < nt; i++) for (let k = 0; k < 3; k++) {
+      st[sp++] = src[i * 9 + k * 3]; st[sp++] = src[i * 9 + k * 3 + 1]; st[sp++] = src[i * 9 + k * 3 + 2];
+      st[sp++] = uvA ? uvA[i * 6 + k * 2] : 0; st[sp++] = uvA ? uvA[i * 6 + k * 2 + 1] : 0;
+    }
+    let P = new Float32Array(Math.max(1024, nt * 9 * 4)), U = new Float32Array(Math.max(1024, nt * 6 * 4)), pp = 0, up = 0;
+    const t = new Float64Array(15);
+    let guard = 0;
+    while (sp > 0 && guard++ < 400000) {
+      if (guard % STEP === 0) yield;
+      sp -= 15; for (let q = 0; q < 15; q++) t[q] = st[sp + q];
+      const e0 = (t[0] - t[5]) ** 2 + (t[1] - t[6]) ** 2 + (t[2] - t[7]) ** 2;
+      const e1 = (t[5] - t[10]) ** 2 + (t[6] - t[11]) ** 2 + (t[7] - t[12]) ** 2;
+      const e2 = (t[10] - t[0]) ** 2 + (t[11] - t[1]) ** 2 + (t[12] - t[2]) ** 2;
+      const mx = Math.max(e0, e1, e2), k = e0 === mx ? 0 : e1 === mx ? 1 : 2;
+      if (mx <= m2) {
+        if (pp + 9 > P.length) { const n2 = new Float32Array(P.length * 2); n2.set(P); P = n2; }
+        if (up + 6 > U.length) { const n2 = new Float32Array(U.length * 2); n2.set(U); U = n2; }
+        for (let v = 0; v < 3; v++) { P[pp++] = t[v * 5]; P[pp++] = t[v * 5 + 1]; P[pp++] = t[v * 5 + 2]; U[up++] = t[v * 5 + 3]; U[up++] = t[v * 5 + 4]; }
+        continue;
+      }
+      const a = k * 5, b = ((k + 1) % 3) * 5, c = ((k + 2) % 3) * 5;
+      if (sp + 30 > st.length) { const n2 = new Float64Array(st.length * 2); n2.set(st); st = n2; }
+      // push [a, m, c] then [m, b, c] (m = midpoint of a and b), exactly as before
+      for (let q = 0; q < 5; q++) st[sp + q] = t[a + q];
+      for (let q = 0; q < 5; q++) st[sp + 5 + q] = (t[a + q] + t[b + q]) / 2;
+      for (let q = 0; q < 5; q++) st[sp + 10 + q] = t[c + q];
+      for (let q = 0; q < 5; q++) st[sp + 15 + q] = (t[a + q] + t[b + q]) / 2;
+      for (let q = 0; q < 5; q++) st[sp + 20 + q] = t[b + q];
+      for (let q = 0; q < 5; q++) st[sp + 25 + q] = t[c + q];
+      sp += 30;
+    }
+    const out = new T.BufferGeometry();
+    out.setAttribute('position', new T.BufferAttribute(P.slice(0, pp), 3));
+    out.setAttribute('uv', new T.BufferAttribute(U.slice(0, up), 2));
+    return out;
+  };
+  K.tessellate = (geo, maxEdge) => drain(K.tessellateG(geo, maxEdge));
+
+  K.smoothG = function* (geo, creaseDeg) {
+    if (geo.index) geo = geo.toNonIndexed();
+    const pos = geo.attributes.position, n = pos.count, Pa = pos.array;
+    const fn = new Float32Array(n * 3), fu = new Float32Array(n * 3);
+    for (let i = 0; i < n; i += 3) {
+      if (i % (STEP * 3) === 0 && i) yield;
+      const ax = Pa[i * 3], ay = Pa[i * 3 + 1], az = Pa[i * 3 + 2], bx = Pa[i * 3 + 3], by = Pa[i * 3 + 4], bz = Pa[i * 3 + 5], cx = Pa[i * 3 + 6], cy = Pa[i * 3 + 7], cz = Pa[i * 3 + 8];
+      const ux = cx - bx, uy = cy - by, uz = cz - bz, vx = ax - bx, vy = ay - by, vz = az - bz;   // cb x ab, as Vector3 did
+      const x = uy * vz - uz * vy, y = uz * vx - ux * vz, z = ux * vy - uy * vx;
+      const len = Math.sqrt(x * x + y * y + z * z) || 1e-12;
+      for (let k = 0; k < 3; k++) { const j = (i + k) * 3; fu[j] = x; fu[j + 1] = y; fu[j + 2] = z; fn[j] = x / len; fn[j + 1] = y / len; fn[j + 2] = z / len; }
+    }
+    const q = 1e4, keys = new Float64Array(n);
+    let size = 1; while (size < n * 2) size <<= 1;
+    const head = new Int32Array(size).fill(-1), tail = new Int32Array(size), next = new Int32Array(n).fill(-1), mask = size - 1;
+    for (let i = 0; i < n; i++) {
+      if (i % (STEP * 2) === 0 && i) yield;
+      const X = Math.round(Pa[i * 3] * q) + 49999, Y = Math.round(Pa[i * 3 + 1] * q) + 49999, Z = Math.round(Pa[i * 3 + 2] * q) + 49999;
+      const key = X * 1e10 + Y * 1e5 + Z; keys[i] = key;
+      let h = (Math.imul(X, 73856093) ^ Math.imul(Y, 19349663) ^ Math.imul(Z, 83492791)) & mask;
+      while (head[h] !== -1 && keys[head[h]] !== key) h = (h + 1) & mask;
+      if (head[h] === -1) { head[h] = i; tail[h] = i; } else { next[tail[h]] = i; tail[h] = i; }
+    }
+    const cos = Math.cos((creaseDeg == null ? 45 : creaseDeg) * Math.PI / 180), out = new Float32Array(n * 3);
+    let work = 0;
+    for (let s = 0; s < size; s++) {
+      const h0 = head[s]; if (h0 === -1) continue;
+      for (let i = h0; i !== -1; i = next[i]) {
+        let x = 0, y = 0, z = 0; const i3 = i * 3;
+        for (let j = h0; j !== -1; j = next[j]) {
+          const j3 = j * 3; work++;
+          if (fn[i3] * fn[j3] + fn[i3 + 1] * fn[j3 + 1] + fn[i3 + 2] * fn[j3 + 2] >= cos) { x += fu[j3]; y += fu[j3 + 1]; z += fu[j3 + 2]; }
+        }
+        const L = Math.hypot(x, y, z) || 1; out[i3] = x / L; out[i3 + 1] = y / L; out[i3 + 2] = z / L;
+      }
+      if (work > STEP * 4) { work = 0; yield; }
+    }
+    geo.setAttribute('normal', new T.BufferAttribute(out, 3));
+    return geo;
+  };
+  K.smooth = (geo, creaseDeg) => drain(K.smoothG(geo, creaseDeg));
+
+  K.wrapOvalG = function* (geo, a, b, phi0, crease, maxEdge) {
+    // Normals are made on the FLAT part and then rotated with the surface (see the note in the original helper)
+    geo = yield* K.smoothG(yield* K.tessellateG(geo, maxEdge || 0.008), crease === false ? 0 : crease == null ? 50 : crease);
+    const pos = geo.attributes.position, nor = geo.attributes.normal, P = pos.array, N = nor.array;
+    const ds = Math.sqrt(a * a * Math.cos(phi0) ** 2 + b * b * Math.sin(phi0) ** 2);
+    for (let i = 0; i < pos.count; i++) {
+      if (i % (STEP * 3) === 0 && i) yield;
+      const i3 = i * 3, vx = P[i3], vy = P[i3 + 1], vz = P[i3 + 2], n0 = N[i3], n1 = N[i3 + 1], n2 = N[i3 + 2];
+      const p = phi0 + vx / ds, sn = Math.sin(p), cs = Math.cos(p);
+      let nx = b * sn, nz = a * cs; const L = Math.hypot(nx, nz); nx /= L; nz /= L;
+      const tx = nz, tz = -nx;
+      P[i3] = a * sn + nx * vz; P[i3 + 1] = vy; P[i3 + 2] = b * cs + nz * vz;
+      const wx = n0 * tx + n2 * nx, wy = n1, wz = n0 * tz + n2 * nz, l = Math.hypot(wx, wy, wz) || 1;
+      N[i3] = wx / l; N[i3 + 1] = wy / l; N[i3 + 2] = wz / l;
+    }
+    pos.needsUpdate = true; nor.needsUpdate = true;
+    return geo;
+  };
+  K.wrapOval = (geo, a, b, phi0, crease, maxEdge) => drain(K.wrapOvalG(geo, a, b, phi0, crease, maxEdge));
+
+  // studio environment in slices: the same scene and the same PMREM passes as fromScene(), one pass per slice
+  const PHI = (1 + Math.sqrt(5)) / 2, IPHI = 1 / PHI;
+  const AXES = [[1, 1, 1], [-1, 1, 1], [1, 1, -1], [-1, 1, -1], [0, PHI, IPHI], [0, PHI, -IPHI], [IPHI, 0, PHI], [-IPHI, 0, PHI], [PHI, IPHI, 0], [-PHI, IPHI, 0]].map((v) => new T.Vector3(v[0], v[1], v[2]));
+  K.studioEnvG = function* (renderer, o) {
+    o = o || {};
+    const s = new T.Scene(), geos = [], mats = [];
+    const room = new T.Mesh(new T.BoxGeometry(12, 8, 12), new T.MeshBasicMaterial({ color: o.room || 0x0b0b0c, side: T.BackSide }));
+    room.position.y = 2.5; s.add(room); geos.push(room.geometry); mats.push(room.material);
+    const floor = new T.Mesh(new T.PlaneGeometry(12, 12), new T.MeshBasicMaterial({ color: o.floor || 0x060606 }));
+    floor.rotation.x = -Math.PI / 2; floor.position.y = -1.4; s.add(floor); geos.push(floor.geometry); mats.push(floor.material);
+    const panels = o.panels || [
+      { w: 3.0, h: 4.6, color: 0xfff1e3, i: 6, p: [-3.4, 2.0, 3.8] },
+      { w: 0.7, h: 5.5, color: 0xe2ebff, i: 14, p: [3.8, 1.8, -3.0] },
+      { w: 0.7, h: 5.5, color: 0xfff6ee, i: 9, p: [-4.2, 1.8, -2.6] },
+      { w: 0.5, h: 5.0, color: 0xfff4ea, i: 7, p: [-5.2, 1.6, 0.6] },
+      { w: 3.2, h: 3.2, color: 0xffffff, i: 5, p: [0, 5.8, 0.3] },
+      { w: 5.5, h: 4.2, color: 0xfff3e6, i: 0.9, p: [0.6, 2.4, 5.4] },
+      { w: 1.6, h: 1.2, color: 0xffb27a, i: 3, p: [3.2, 0.3, 3.4] },
+    ];
+    panels.forEach((q) => {
+      const m = new T.Mesh(new T.PlaneGeometry(q.w, q.h), new T.MeshBasicMaterial({ color: new T.Color(q.color).multiplyScalar(q.i), side: T.DoubleSide }));
+      m.position.fromArray(q.p); m.lookAt(0, 1, 0); s.add(m); geos.push(m.geometry); mats.push(m.material);
+    });
+    const pm = new T.PMREMGenerator(renderer);
+    if (!pm._allocateTargets || !pm._sceneToCubeUV || !pm._blur || !pm._sigmas) { const rt0 = pm.fromScene(s, o.blur == null ? 0.03 : o.blur); pm.dispose(); geos.forEach((x) => x.dispose()); mats.forEach((x) => x.dispose()); return rt0.texture; }
+    const old = [renderer.getRenderTarget(), renderer.getActiveCubeFace(), renderer.getActiveMipmapLevel()];
+    const restore = () => renderer.setRenderTarget(old[0], old[1], old[2]);
+    yield;
+    pm._setSize(256);
+    const rt = pm._allocateTargets(); rt.depthBuffer = true;
+    restore(); yield;
+    // compile the PMREM shaders (scene + blur) without blocking, with the same state the passes use: render target set,
+    // no tone mapping; the sync passes below then find their programs ready
+    if (renderer.compileAsync && pm._blurMaterial && pm._lodPlanes) {
+      const tm = renderer.toneMapping; renderer.toneMapping = T.NoToneMapping; renderer.setRenderTarget(rt);
+      const cam = new T.PerspectiveCamera(90, 1, 0.1, 100), bs = new T.Scene(); bs.add(new T.Mesh(pm._lodPlanes[0], pm._blurMaterial));
+      const ps = [renderer.compileAsync(s, cam), renderer.compileAsync(bs, cam)];
+      renderer.toneMapping = tm; restore();
+      yield Promise.all(ps).catch(() => {});
+    }
+    pm._sceneToCubeUV(s, 0.1, 100, rt);
+    restore(); yield;
+    const sigma = o.blur == null ? 0.03 : o.blur;
+    if (sigma > 0) { pm._blur(rt, 0, 0, sigma); restore(); yield; }
+    for (let e = 1; e < pm._lodPlanes.length; e++) {
+      const ac = renderer.autoClear; renderer.autoClear = false;
+      const n = Math.sqrt(pm._sigmas[e] * pm._sigmas[e] - pm._sigmas[e - 1] * pm._sigmas[e - 1]);
+      pm._blur(rt, e - 1, e, n, AXES[(e - 1) % AXES.length]);
+      renderer.autoClear = ac; restore();
+      if (e % 2 === 0) yield;
+    }
+    restore(); rt.scissorTest = false; rt.viewport.set(0, 0, rt.width, rt.height); rt.scissor.set(0, 0, rt.width, rt.height);
+    pm.dispose(); geos.forEach((x) => x.dispose()); mats.forEach((x) => x.dispose());
+    return rt.texture;
+  };
   K.mesh = (geo, mat) => new T.Mesh(geo, mat);
   g.TDKit = K;
 })(window);
@@ -423,7 +590,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
   const T = g.THREE, K = g.TDKit;
   const V3 = T.Vector3, Q = T.Quaternion, E = T.Euler;
 
-  function create(o) {
+  function* build(o, async) {
     const mount = o.mount, ui = o.ui || {};
     const qs = new URLSearchParams(location.search);
     const reduced = qs.get('rm') === '1' || (g.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches);
@@ -431,14 +598,21 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     const state = { mode: 'assembled', group: null };
     const api = { dbg, state, reduced };
     g.TD = api;
+    if (async) yield api;
 
     function fallback(why) { dbg.mode = 'fallback:' + why; document.documentElement.classList.add('td-fallback'); }
 
     let renderer;
     try {
-      renderer = new T.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'high-performance' });
+      let cv0;
+      if (async) {                                   // same size and pixel ratio resize() will choose
+        const w0 = mount.clientWidth, h0 = mount.clientHeight;
+        if (w0 && h0) { const cap0 = Math.min(w0, h0) < 600 ? (o.dprSmall || 1.5) : (o.dprMax || 2), d0 = Math.max(1, Math.min(g.devicePixelRatio || 1, cap0)); cv0 = document.createElement('canvas'); cv0.width = Math.floor(w0 * d0); cv0.height = Math.floor(h0 * d0); }
+      }
+      renderer = new T.WebGLRenderer(cv0 ? { canvas: cv0, antialias: true, alpha: true, powerPreference: 'high-performance' } : { antialias: true, alpha: true, powerPreference: 'high-performance' });
       if (!renderer.getContext()) throw new Error('no context');
     } catch (e) { fallback('no-webgl'); return api; }
+    if (async) yield;
     const canvas = renderer.domElement;
     canvas.setAttribute('aria-label', o.ariaLabel || 'Interactive 3D illustration. Drag to turn, tap a part.');
     canvas.setAttribute('role', 'img');
@@ -454,12 +628,16 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
 
     const scene = new T.Scene();
     const camera = new T.PerspectiveCamera(30, 1, 0.02, 60);
-    const env = K.studioEnv(renderer, o.studio);
+    const env = async && K.studioEnvG ? yield* K.studioEnvG(renderer, o.studio) : K.studioEnv(renderer, o.studio);
+    if (async) yield;
     K.studioLights(scene, o.lights);
-    const reg = o.model(T, K, { env, renderer, scene, camera });
+    let reg = o.model(T, K, { env, renderer, scene, camera });
+    if (reg && typeof reg.next === 'function') reg = async ? yield* reg : K.drain(reg);
+    if (async) yield;
     if (qs.has('still')) reg.idleSway = false;
     const root = reg.root; scene.add(root);
     if (reg.fog) scene.fog = new T.Fog(reg.fog.color, 1, 10);
+    if (async) yield 'parts';
 
     // ---------- parts ----------
     const parts = new Map(), pickables = [];
@@ -616,7 +794,8 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       camera.setViewOffset(fullW, full, dx > 0 ? 2 * dx : 0, d > 0 ? 2 * d : 0, W, H);
       const cap = Math.min(W, H) < 600 ? (o.dprSmall || 1.5) : (o.dprMax || 2);
       dpr = Math.min(g.devicePixelRatio || 1, cap) - dbg.dprDrops * 0.25; dpr = Math.max(1, dpr); dbg.dpr = dpr;
-      renderer.setPixelRatio(dpr); renderer.setSize(W, H, false);
+      // one buffer change (setPixelRatio then setSize resized the canvas twice, the first time to dpr squared)
+      if (renderer.setDrawingBufferSize) renderer.setDrawingBufferSize(W, H, dpr); else { renderer.setPixelRatio(dpr); renderer.setSize(W, H, false); }
       const ns = Wf / Hf < 0.75 ? (reg.narrowSpreadX || 0.72) : 1;
       if (ns !== spreadX) { spreadX = ns; if (state.mode === 'exploded') { const p = { mode: state.mode, group: state.group }; retarget('resize', p); } }
       measureLabels(); dirty = true;
@@ -762,7 +941,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     g.addEventListener('keydown', (e) => { if (e.target && e.target.closest && e.target.closest('input,textarea,select')) return; if (e.key === 'Escape' && !document.documentElement.classList.contains('sheet-open') && visible) reset(); });
 
     // ---------- loop, visibility, adaptive DPR ----------
-    let held = false, dirty = true, running = false, visible = true, last = performance.now(), slow = 0, frames = 0;
+    let live = !async, held = false, dirty = true, running = false, visible = true, last = performance.now(), slow = 0, frames = 0;
     function frame(now) {
       const dt = Math.min(0.05, (now - last) / 1000); last = now; dbg.frames++;
       const a = stepParts(now), m = stepCamera(dt, now);
@@ -777,21 +956,23 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       if (frames >= 120) { if (slow > 60 && dpr > 1 && dbg.dprDrops < 3) { dbg.dprDrops++; resize.t = -1; resize(); } frames = 0; slow = 0; }
     }
     function setRunning() {
-      const want = visible && !document.hidden && !dbg.lost && !held;
+      const want = live && visible && !document.hidden && !dbg.lost && !held;   // async: no frames until the build is done
       if (want === running) return; running = want; last = performance.now();
       renderer.setAnimationLoop(want ? frame : null);
     }
     if ('IntersectionObserver' in g) new IntersectionObserver((es) => { visible = es[0].isIntersecting; setRunning(); }).observe(mount);
     document.addEventListener('visibilitychange', setRunning);
     if ('ResizeObserver' in g) new ResizeObserver(() => resize()).observe(mount); else g.addEventListener('resize', resize);
+    if (async) yield 'resize';
     resize();
+    if (async) yield 'resized';
     if (qs.get('view') === 'ref' && reg.viewRef) { document.documentElement.classList.add('view-ref'); reg.idleSway = false; resize.t = -1; resize(); setPose(reg.viewRef, 0); }
     else setPose(reg.home, 0);
+    if (async) yield 'posed';
     syncUI(); placeCamera();
     // compileAsync (r158+) builds the shader programs without freezing the page where KHR_parallel_shader_compile
     // exists; the poster stays on screen until the first real frame is ready.
-    const start = () => { setRunning(); document.documentElement.classList.add('td-ready'); };
-    if (renderer.compileAsync) renderer.compileAsync(scene, camera).then(start, start); else { renderer.compile(scene, camera); start(); }
+    const start = () => { live = true; setRunning(); document.documentElement.classList.add('td-ready'); if (o.onReady) o.onReady(api); };
 
     Object.assign(api, {
       select, release, teardown, assemble, reset,
@@ -803,10 +984,58 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       info: () => ({ calls: renderer.info.render.calls, tris: renderer.info.render.triangles, geos: renderer.info.memory.geometries, tex: renderer.info.memory.textures, dpr, W, H }),
       renderer, scene, camera, registry: reg,
     });
+    if (async) {
+      // shaders: the engine's own set, then the page's extra materials, each compiled without blocking where the GPU allows
+      const vis0 = new Map(); scene.traverse((ob) => { vis0.set(ob, ob.visible); ob.visible = true; });
+      if (renderer.compileAsync) {
+        // one part per slice: each call builds that part's programs (string work on the main thread), the GPU compiles them in parallel
+        const ps = [];
+        for (const c of root.children) { ps.push(renderer.compileAsync(c, camera, scene).catch(() => {})); yield; }
+        yield Promise.all(ps);
+      } else { yield; renderer.compile(scene, camera); }
+      if (o.prewarm) { const pw = o.prewarm(api); if (pw && typeof pw.next === 'function') yield* pw; else yield Promise.resolve(pw).catch(() => {}); }
+      vis0.forEach((v, ob) => { ob.visible = v; });
+      yield 'upload';
+      // textures one per slice, then each part drawn alone (every mesh shown, internals too) so its buffers reach the GPU
+      // now, on the still-hidden canvas, instead of all at once in the first visible frame or the first teardown
+      const texs = new Set();
+      scene.traverse((ob) => { const ms = ob.material ? (Array.isArray(ob.material) ? ob.material : [ob.material]) : []; ms.forEach((m) => { for (const k in m) { const v = m[k]; if (v && v.isTexture) texs.add(v); } }); });
+      for (const tx of texs) { if (renderer.initTexture) renderer.initTexture(tx); yield; }
+      const kids = root.children.slice(), was = new Map(), drawables = (ob) => ob.isMesh || ob.isPoints || ob.isSprite || ob.isLine;
+      scene.traverse((ob) => { was.set(ob, ob.visible); if (ob !== scene && !ob.isLight) ob.visible = true; });
+      const allD = []; scene.traverse((ob) => { if (drawables(ob)) allD.push(ob); });
+      allD.forEach((ob) => { ob.visible = false; });
+      for (const ob of allD) { ob.visible = true; renderer.render(scene, camera); ob.visible = false; yield; }
+      was.forEach((v, ob) => { ob.visible = v; });
+      renderer.render(scene, camera); dirty = true;
+      yield 'start';
+      start();
+    } else if (renderer.compileAsync) renderer.compileAsync(scene, camera).then(start, start); else { renderer.compile(scene, camera); start(); }
+    return api;
+  }
+  function create(o) { return K.drain(build(o, false)); }
+  // Build in idle slices of about o.budget ms; o.canRun() false (input, a playing video) pauses it; a yielded promise is awaited.
+  function createAsync(o) {
+    const it = build(o, true), api = it.next().value, budget = o.budget || 8;
+    const sched = () => { if (g.requestIdleCallback) g.requestIdleCallback(slice, { timeout: 250 }); else setTimeout(slice, 16); };
+    function slice() {
+      if (o.canRun && !o.canRun()) { setTimeout(slice, 120); return; }
+      const t0 = performance.now();
+      try {
+        do {
+          const s0 = performance.now(), r = it.next();
+          if (g.__tdprof) g.__tdprof.push([Math.round(performance.now() - s0), typeof r.value === 'string' ? r.value : (r.value && r.value.then ? 'promise' : '')]);
+          if (r.done) return;
+          if (r.value && typeof r.value.then === 'function') { r.value.then(sched, sched); return; }
+        } while (performance.now() - t0 < budget);
+      } catch (e) { console.error(e); document.documentElement.classList.add('td-fallback'); if (o.onFail) o.onFail(e); return; }
+      sched();
+    }
+    sched();
     return api;
   }
 
-  g.Teardown = { create };
+  g.Teardown = { create, createAsync };
 })(window);
 
 ;
@@ -816,7 +1045,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
 (function (g) {
   'use strict';
   g.TDModels = g.TDModels || {};
-  g.TDModels.clipper = function (T, K, ctx) {
+  g.TDModels.clipper = function* (T, K, ctx) {
     const env = ctx.env;
     const R = 0.218, OV = 0.88, B = R * OV;            // oval body: x semi-axis R, z semi-axis B
     const Y_CAP = 0.26, Y_LOW = 0.94, Y_GRIP = 1.11, Y_UP = 1.25, Y_TOP = 1.595;
@@ -827,7 +1056,9 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
 
     // ---------- materials: small palette (black, satin black, steel, copper, plaster, one emissive) ----------
     const grain = K.grainNormal(256, 2.2); grain.repeat.set(10, 10);
+    yield 'L18';
     const knurlN = K.knurlNormal(64, 7); knurlN.repeat.set(96, 30);
+    yield 'L20';
     const M = {
       body: K.phys(env, { color: 0x0f0f11, roughness: 0.4, metalness: 0.3, clearcoat: 0.7, clearcoatRoughness: 0.2, normalMap: grain, normalScale: new T.Vector2(0.18, 0.18), envMapIntensity: 1.0 }),
       inner: K.std(env, { color: 0x0a0a0a, roughness: 0.85, metalness: 0.1, envMapIntensity: 0.4 }),
@@ -864,6 +1095,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     add('cap', [capMesh, mesh(ring, M.steelDark), mesh(hole, M.port)], {
       exploded: { p: [0, -0.7, 0] }, lift: { p: [0, -0.24, 0.06], r: [-0.85, 0, 0] },
     });
+    yield 'L57';
 
     const lowMesh = mesh(K.lathe(K.shellProfile(R, Y_CAP, Y_LOW, { fillet: 0.0012 }), SEG, OV), M.body);
     // CAVE, etched small below the switch: a lighter matte decal wrapped onto the shell.
@@ -874,11 +1106,12 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       c.letterSpacing = '22px'; c.fillText('CAVE', w / 2 + 11, h / 2 + 4);
     }, false);
     const etchGeo = new T.PlaneGeometry(0.075, 0.019, 24, 1);
-    const etch = mesh(K.wrapOval(etchGeo, R, B, 0, false), K.std(env, { color: 0x77706a, roughness: 0.7, metalness: 0.2, alphaMap: etchTex, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2 }));
+    const etch = mesh((yield* K.wrapOvalG(etchGeo, R, B, 0, false)), K.std(env, { color: 0x77706a, roughness: 0.7, metalness: 0.2, alphaMap: etchTex, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2 }));
     etch.geometry.translate(0, 0.505, 0);
     // tiny outward push so the decal sits on the shell, not in it
     { const p = etch.geometry.attributes.position; for (let i = 0; i < p.count; i++) { const x = p.getX(i), z = p.getZ(i); const l = Math.hypot(x / R, z / B); p.setXYZ(i, x * (1 + 0.004 / l / R), p.getY(i), z * (1 + 0.004 / l / B)); } }
     add('lower', [lowMesh, etch], { exploded: { p: [0, -0.36, 0] } });
+    yield 'L73';
 
     // Upper body: short shell under the head + the core sleeve the grip band slides over.
     const upMesh = mesh(K.lathe(K.shellProfile(R, Y_GRIP, Y_UP, { fillet: 0.001 }), SEG, OV), M.body);
@@ -886,11 +1119,13 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     // 15 Nov: NOT hidden at rest any more. It is the inner collar behind the two 4 mm seams above and below the grip
     // band; hidden, the seams were see-through all round the body (turntable gate, GATES.md).
     add('upper', [upMesh, sleeve], { exploded: { p: [0, 0.14, 0] } });
+    yield 'L81';
 
     // Grip band: knurled ring with polished chamfer rings at both ends.
     const gripMesh = mesh(K.lathe(K.shellProfile(R - 0.001, Y_LOW + 0.004, Y_GRIP - 0.004, { fillet: 0.005, wall: 0.016 }), SEG, OV), M.knurl);
     const rings = [Y_LOW + 0.006, Y_GRIP - 0.006].map((y) => { const t = new T.TorusGeometry(R - 0.004, 0.0032, 10, SEG); t.rotateX(Math.PI / 2); t.scale(1, 1, OV); t.translate(0, y, 0); return mesh(t, M.steelDark); });
     add('grip', [gripMesh].concat(rings), { exploded: { p: [0, -0.08, 0] }, lift: { p: [0, -0.27, 0.04], r: [0.35, 0.9, 0] } });
+    yield 'L87';
 
     // ---------- head housing: oval wall cut by the face plane, flat top behind the blade ----------
     const topAt = (z) => Math.min(plane(z), Y_TOP);
@@ -910,8 +1145,10 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     const cols = [];
     for (let i = 0; i <= SEG; i++) cols.push(headCol(-Math.PI + (i / SEG) * Math.PI * 2));
     const headWall = mesh(K.grid(SEG, cols[0].length - 1, (i, j) => cols[i][j]), M.body);
+    yield;
     const headInner = mesh(K.grid(SEG, 1, (i, j) => { const phi = -Math.PI + (i / SEG) * Math.PI * 2, k = 1 - 0.032 / R, zS = B * Math.cos(phi) * k; return [R * Math.sin(phi) * k * (j ? 1 : 1), j ? topAt(zS) : Y_UP + 0.002, zS]; }), M.inner);
     headInner.userData.hiddenAtRest = true; // sealed under the face plate while assembled headInner.geometry.index.array.reverse(); headInner.geometry.computeVertexNormals();
+    yield;
 
     // Face plate: half-ellipse of brushed satin black lying in the plane, bevelled all round.
     const nrm = new T.Vector3(0, 1, S).normalize(), up = new T.Vector3(0, S, -1).normalize(), xAx = new T.Vector3(1, 0, 0);
@@ -923,6 +1160,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     plateGeo.translate(0, 0, -0.004);
     plateGeo.applyMatrix4(new T.Matrix4().makeBasis(xAx, up, nrm).setPosition(0, HC, 0));
     const plate = mesh(plateGeo, M.satin);
+    yield;
 
     // Blade mount: flat satin cap on the back half of the top.
     const mp = [];
@@ -931,6 +1169,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     const mountGeo = K.extrude(new T.Shape(mp), 0.004, 0.006, 3, 10, 55);
     mountGeo.rotateX(-Math.PI / 2); mountGeo.translate(0, Y_TOP - 0.006, 0);
     const mount = mesh(mountGeo, M.satin);
+    yield;
 
     // Taper lever: a copper teardrop on the right side of the head, pivoting at its narrow top, inside a steel rim.
     const LPHI = 1.72, LY = 1.455; // centre: angle around the body (0 = front, pi/2 = +x) and height
@@ -942,27 +1181,31 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     }
     const frameShape = drop(new T.Shape(), 0.04, 0.069, 0.13);
     frameShape.holes.push(drop(new T.Path(), 0.031, 0.058, 0.13));
-    const frame = mesh(K.wrapOval(K.extrude(frameShape, 0.002, 0.0028, 3, 16, 55), R, B, LPHI), M.steel);
+    const frame = mesh((yield* K.wrapOvalG(K.extrude(frameShape, 0.002, 0.0028, 3, 16, 55), R, B, LPHI)), M.steel);
     add('head', [headWall, headInner, plate, mount, frame], {
       exploded: { p: [0, 0.42, 0] }, lift: { p: [0, 0.3, 0.02], r: [0.18, 0, 0] },
     });
+    yield 'L143';
 
-    const lever = mesh(K.wrapOval(K.extrude(drop(new T.Shape(), 0.029, 0.055, 0.13), 0.006, 0.004, 4, 16, 55), R + 0.001, B + 0.001, LPHI), M.copper);
+    const lever = mesh((yield* K.wrapOvalG(K.extrude(drop(new T.Shape(), 0.029, 0.055, 0.13), 0.006, 0.004, 4, 16, 55), R + 0.001, B + 0.001, LPHI)), M.copper);
     const pivot = new T.CylinderGeometry(0.011, 0.012, 0.006, 28); pivot.rotateX(Math.PI / 2);
-    const pv = mesh(K.wrapOval(pivot.translate(0, LY + 0.065, 0.018).toNonIndexed(), R, B, LPHI), M.steel);
+    const pv = mesh((yield* K.wrapOvalG(pivot.translate(0, LY + 0.065, 0.018).toNonIndexed(), R, B, LPHI)), M.steel);
     const nubG = K.roundedBox(0.05, 0.016, 0.01, 0.0045, 3); nubG.translate(0, LY - 0.075, 0.017);
-    const leverNub = mesh(K.wrapOval(nubG, R, B, LPHI), M.copper);
+    const leverNub = mesh((yield* K.wrapOvalG(nubG, R, B, LPHI)), M.copper);
     add('lever', [lever, pv, leverNub], { exploded: { p: [0.34, 0.42, -0.1], r: [0, -1.25, 0] }, lift: { p: [0.27, 0.05, -0.03], r: [0, -0.15, 0.12] } });
+    yield 'L151';
 
     // ---------- blade: fixed comb + moving cutter with real teeth, two screws ----------
     const tilt = -0.24, bladeM = new T.Matrix4().makeTranslation(0, Y_TOP + 0.004, -0.04).multiply(new T.Matrix4().makeRotationX(tilt));
     const combGeo = K.extrude(K.toothedPlate({ w: 0.37, h: 0.072, teeth: 27, toothLen: 0.047, fill: 0.56, tip: 0.32, corner: 0.012 }), 0.003, 0.0012, 2, 4, 40);
     combGeo.translate(0, -0.02, -0.0042).applyMatrix4(bladeM);
     add('comb', [mesh(combGeo, M.steel)], { exploded: { p: [0, 0.8, -0.02], r: [0.2, 0, 0] }, lift: { p: [0, 0.3, 0.05], r: [0.3, 0, 0] } });
+    yield 'L158';
     const cutGeo = K.extrude(K.toothedPlate({ w: 0.33, h: 0.05, teeth: 24, toothLen: 0.03, fill: 0.66, tip: 0.24, corner: 0.01 }), 0.0025, 0.001, 2, 4, 40);
     cutGeo.translate(0, -0.006, 0.0012).applyMatrix4(bladeM);
     const yoke = K.roundedBox(0.05, 0.03, 0.008, 0.003, 2); yoke.translate(0, 0.006, 0.0085).applyMatrix4(bladeM);
     add('cutter', [mesh(cutGeo, M.steelDark), mesh(yoke, M.steelDark)], { exploded: { p: [0, 0.66, 0.12], r: [0.2, 0, 0] }, lift: { p: [0, 0.22, 0.16], r: [0.3, 0, 0] } });
+    yield 'L163';
     // screws: instanced dome heads + cross slots
     const headG = K.lathe(K.filletPath([[0, 0.0045], [0.008, 0.0042, 0.003], [0.011, 0], [0, 0]], 4), 32, 1);
     headG.rotateX(-Math.PI / 2);
@@ -973,21 +1216,24 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       screwHeads.setMatrixAt(i, at);
       [0, Math.PI / 2].forEach((a, j) => { rz.makeRotationZ(a); sm.copy(at).multiply(new T.Matrix4().makeTranslation(0, 0, -0.004)).multiply(rz); slots.setMatrixAt(i * 2 + j, sm); });
     });
+    yield 'L174';
     add('screws', [screwHeads, slots], { exploded: { p: [0, 0.7, -0.17] }, lift: { p: [0, 0.27, -0.07] } });
+    yield 'L176';
 
     // ---------- switch: copper plate, LED slot and two grooves are holes showing layers beneath ----------
     const SY = 0.72, sw = K.roundRect(0.098, 0.19, 0.022, 0, SY);
     sw.holes.push(K.roundRectHole(0.05, 0.0085, 0.0042, 0, SY + 0.06));
     sw.holes.push(K.roundRectHole(0.056, 0.0075, 0.0037, 0, SY - 0.012));
     sw.holes.push(K.roundRectHole(0.056, 0.0075, 0.0037, 0, SY - 0.034));
-    const swGeo = K.wrapOval(K.extrude(sw, 0.004, 0.004, 3, 10, 55), R, B, 0);
-    const ledGeo = K.wrapOval(K.extrude(K.roundRect(0.054, 0.012, 0.005, 0, SY + 0.06), 0.002, 0, 1, 8), R, B, 0);
-    const bedGeo = K.wrapOval(K.extrude(K.roundRect(0.09, 0.18, 0.02, 0, SY), 0.003, 0, 1, 8), R - 0.0015, B - 0.0015, 0);
+    const swGeo = (yield* K.wrapOvalG(K.extrude(sw, 0.004, 0.004, 3, 10, 55), R, B, 0));
+    const ledGeo = (yield* K.wrapOvalG(K.extrude(K.roundRect(0.054, 0.012, 0.005, 0, SY + 0.06), 0.002, 0, 1, 8), R, B, 0));
+    const bedGeo = (yield* K.wrapOvalG(K.extrude(K.roundRect(0.09, 0.18, 0.02, 0, SY), 0.003, 0, 1, 8), R - 0.0015, B - 0.0015, 0));
     const glowTex = K.canvasTex(64, 64, (c, w) => { const gr = c.createRadialGradient(w / 2, w / 2, 0, w / 2, w / 2, w / 2); gr.addColorStop(0, 'rgba(255,170,110,0.9)'); gr.addColorStop(0.35, 'rgba(255,120,60,0.35)'); gr.addColorStop(1, 'rgba(255,90,30,0)'); c.fillStyle = gr; c.fillRect(0, 0, w, w); });
     const glow = new T.Sprite(new T.SpriteMaterial({ map: glowTex, blending: T.AdditiveBlending, depthWrite: false, transparent: true, opacity: 0.85 }));
     glow.scale.set(0.085, 0.04, 1); glow.position.set(0, SY + 0.06, B + 0.022);
     const ledLight = new T.PointLight(0xff8a45, 0.018, 0.5, 2); ledLight.position.set(0, SY + 0.06, B + 0.03);
     const swOb = add('switch', [mesh(swGeo, M.copper), mesh(ledGeo, M.led), mesh(bedGeo, M.port)], { exploded: { p: [-0.04, 0, 0.36] }, lift: { p: [0, 0.02, 0.22], r: [0, -0.15, 0] } });
+    yield 'L191';
     glow.position.sub(swOb.position); ledLight.position.sub(swOb.position); swOb.add(glow, ledLight);
 
     // ---------- inside: motor with copper windings, drive cam, battery, circuit board ----------
@@ -997,6 +1243,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     coilG.translate(0, (MY0 + MY1) / 2, 0);
     const coils = new T.InstancedMesh(coilG, M.wire, 3), m4 = new T.Matrix4();
     for (let i = 0; i < 3; i++) { m4.makeTranslation(0, (MY0 + MY1) / 2, 0).multiply(new T.Matrix4().makeRotationY(i * Math.PI * 2 / 3 + 0.5)).multiply(new T.Matrix4().makeTranslation(0, -(MY0 + MY1) / 2, 0)); coils.setMatrixAt(i, m4); }
+    yield;
     const poleG = K.roundedBox(0.06, 0.04, 0.03, 0.004, 2); poleG.translate(0.065, (MY0 + MY1) / 2, 0);
     const poles = new T.InstancedMesh(poleG, M.steelDark, 3);
     for (let i = 0; i < 3; i++) { m4.makeTranslation(0, (MY0 + MY1) / 2, 0).multiply(new T.Matrix4().makeRotationY(i * Math.PI * 2 / 3 + 0.5)).multiply(new T.Matrix4().makeTranslation(0, -(MY0 + MY1) / 2, 0)); poles.setMatrixAt(i, m4); }
@@ -1005,15 +1252,18 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     const pillars = new T.InstancedMesh(pillarG, M.steel, 3);
     for (let i = 0; i < 3; i++) { const a = i * Math.PI * 2 / 3 + 0.5 + Math.PI / 3; m4.makeTranslation(Math.cos(a) * 0.097, 0, Math.sin(a) * 0.097); pillars.setMatrixAt(i, m4); }
     const shaft = new T.CylinderGeometry(0.0055, 0.0055, 0.32, 16); shaft.translate(0, (MY0 + MY1) / 2 + 0.02, 0);
+    yield;
     add('motor', [mesh(bell(MY0, MY0 + 0.022), M.steelDark), mesh(bell(MY1 - 0.022, MY1), M.steelDark), coils, poles, mesh(hub, M.steelDark), pillars, mesh(shaft, M.steel)], {
       hiddenAtRest: true, exploded: { p: [0.44, 0.08, 0.04] }, lift: { p: [0.4, 0.12, 0.12], r: [0.18, 0.3, 0] },
     });
+    yield 'L212';
     // Drive cam: eccentric disc with a pin, pushes the cutter's yoke side to side.
     const camShape = new T.Shape(); camShape.absarc(0.012, 0, 0.03, 0, Math.PI * 2, false);
     const camG = K.extrude(camShape, 0.006, 0.003, 3, 32, 50); camG.rotateX(-Math.PI / 2); camG.translate(0, 1.4, 0);
     const pin = new T.CylinderGeometry(0.0065, 0.0065, 0.05, 16); pin.translate(0.028, 1.44, 0);
     const arm = K.roundedBox(0.03, 0.12, 0.012, 0.005, 2); arm.translate(0.028, 1.5, -0.012);
     add('cam', [mesh(camG, M.copper), mesh(pin, M.steel), mesh(arm, M.steelDark)], { hiddenAtRest: true, exploded: { p: [-0.36, 0.36, 0.1] }, lift: { p: [0.4, 0.36, 0.12], r: [0.3, 0.3, 0] } });
+    yield 'L219';
 
     // Battery: one cylindrical cell in a plaster-beige wrap with a black band and a peach line.
     const batTex = K.canvasTex(64, 512, (c, w, h) => {
@@ -1022,6 +1272,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       c.fillStyle = '#141210'; c.fillRect(0, h * 0.62, w, h * 0.12);
       c.fillStyle = '#f39a62'; c.fillRect(0, h * 0.6, w, h * 0.012);
     });
+    yield 'L228';
     batTex.flipY = false;
     const BZ = -0.035, BR = 0.074;
     const batG = K.lathe(K.filletPath([[0, 0.3], [BR, 0.3, 0.012], [BR, 0.9, 0.012], [0, 0.9]], 6), 64, 1);
@@ -1030,6 +1281,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     add('battery', [mesh(batG, K.phys(env, { map: batTex, roughness: 0.32, metalness: 0.05, clearcoat: 0.7, clearcoatRoughness: 0.12 })), mesh(nub, M.steel)], {
       hiddenAtRest: true, exploded: { p: [-0.5, -0.4, -0.05] }, lift: { p: [-0.31, -0.1, 0.1], r: [0, 0.3, 0.22] },
     });
+    yield 'L237';
 
     // Circuit board: black solder mask, copper traces, gold pads; parts instanced. Sits behind the switch.
     const BW = 0.16, BH = 0.3, BYc = 0.62, BZc = 0.097;
@@ -1041,6 +1293,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       c.fillStyle = '#c9a24e'; for (let i = 0; i < 40; i++) { c.beginPath(); c.arc(16 + r() * (w - 32), 16 + r() * (h - 32), 4, 0, 7); c.fill(); }
       c.fillStyle = 'rgba(230,224,214,0.85)'; c.font = '700 22px Archivo, sans-serif'; c.fillText('CAVE', 18, h - 22);
     });
+    yield 'L249';
     pcbTex.repeat.set(1 / BW, 1 / BH); pcbTex.offset.set(0.5, 0.5);
     const boardG = K.roundedBox(BW, BH, 0.01, 0.0035, 2);
     const boardM = [K.std(env, { map: pcbTex, roughness: 0.5, metalness: 0.15 })];
@@ -1053,6 +1306,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     const tact = K.roundedBox(0.03, 0.03, 0.012, 0.002, 2); tact.translate(0, SY - 0.005, BZc + 0.011);
     const tactB = new T.CylinderGeometry(0.008, 0.008, 0.01, 20).rotateX(Math.PI / 2).translate(0, SY - 0.005, BZc + 0.021);
     add('board', [board, chips, caps, mesh(tact, M.steel), mesh(tactB, M.chip)], { hiddenAtRest: true, exploded: { p: [0.48, -0.32, 0.1] }, lift: { p: [0.3, -0.12, 0.16], r: [0, -0.45, 0] } });
+    yield 'L262';
 
     // ---------- scene dressing: contact shadow, dust ----------
     const root = new T.Group();
@@ -1061,6 +1315,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     const capOb = parts[0].object, capY = capOb.position.y;
     const dust = K.dust(160, 0.009, [3.2, 3.2, 2.4]); dust.position.y = -0.2; root.add(dust);
 
+    yield 'm-reg';
     // ---------- registry ----------
     const g2 = (id, label, short, caption, ps, o) => Object.assign({ id, label, short, caption, parts: ps }, o);
     return {

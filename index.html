@@ -969,6 +969,22 @@ button,input,select,textarea{font-family:inherit}
 .cut::before,.room::before,.details::after{background:url(img/plaster_tint.webp) 0 0/700px,var(--plaster);background-blend-mode:normal}
 /* the logo plate: a pinned print like The Cave photos; a rounded, blurred-shadow image cost a 100-130 ms GPU stall */
 .plate{border-radius:0!important;border:2px solid var(--bone);outline:1px solid var(--tobacco);box-shadow:3px 4px 0 rgba(26,20,15,.16)}
+/* td-xfade: the 3D view fades in over the poster once it is fully ready (opacity only) */
+.tstage canvas{transition:opacity .45s ease}
+html:not(.td-ready) .tstage canvas{opacity:0}
+.td-poster{transition:opacity .45s ease .1s}
+html.td-ready .td-poster{display:block;opacity:0;pointer-events:none}
+.td-btn.is-loading{opacity:.75;cursor:progress}
+@media (prefers-reduced-motion:reduce){.tstage canvas,.td-poster{transition:none}}
+/* phones: the part chips' row is reserved before the 3D view builds them, so the stage never changes size mid-build
+   (a size change re-allocates the WebGL buffer: ~100 ms on a slow phone) and nothing below it jumps */
+@media (max-width:899px){#tchips{min-height:56px;box-sizing:border-box}}
+/* horizontal strips (day picker, part chips): the first item starts at the page gutter and stays there; snapping
+   respects the gutter (scroll-padding), the end keeps the same gutter in every engine (a spacer, as WebKit drops
+   end padding in scrollers), and the notch/safe area is included. The strip still bleeds to the screen edge. */
+.days,.td-chips{padding-left:max(var(--pad),env(safe-area-inset-left,0px));padding-right:0;scroll-padding-inline:max(var(--pad),env(safe-area-inset-left,0px)) max(var(--pad),env(safe-area-inset-right,0px))}
+.days::after,.td-chips::after{content:"";flex:0 0 calc(max(var(--pad),env(safe-area-inset-right,0px)) - 8px);align-self:stretch}
+.day{scroll-snap-align:start}
 
 </style>
 <script>document.documentElement.classList.add('js', 'in-hero')</script>
@@ -1230,6 +1246,16 @@ button,input,select,textarea{font-family:inherit}
   /* ---- THE TOOL ---- */
   /* ---- THE TOOL: the 3D clipper (object-teardown-3d engine). Loaded only when the visitor is near it; poster until the
          first frame; static list without WebGL. Parts take flat tints while apart and their real finish when seated. ---- */
+  var lastInputT = 0, pendingTear = false;
+  ['scroll', 'touchstart', 'pointerdown', 'keydown', 'wheel'].forEach(function (ev) { W.addEventListener(ev, function () { lastInputT = performance.now(); }, { passive: true, capture: true }); });
+  function videoPlaying() { var vs = [D.getElementById('film'), D.getElementById('cutvid')]; for (var i = 0; i < vs.length; i++) { var v = vs[i]; if (v && !v.hidden && !v.paused && !v.ended) return true; } return false; }
+  function mainLoading(on) {
+    var b = D.getElementById('tmain'); if (!b) return;
+    if (on) { if (!b.classList.contains('is-loading')) { b.dataset.label = b.textContent; b.textContent = 'Loading the 3D view…'; } b.classList.add('is-loading'); b.setAttribute('aria-busy', 'true'); }
+    else if (b.classList.contains('is-loading')) { b.classList.remove('is-loading'); b.removeAttribute('aria-busy'); if (b.dataset.label && /Loading/.test(b.textContent)) b.textContent = b.dataset.label; }
+  }
+  /* before the 3D view is ready, "Take it apart" shows that it is loading (and runs once ready) instead of doing nothing */
+  (function () { var b = D.getElementById('tmain'); if (!b) return; b.addEventListener('click', function (e) { if (TD || R.classList.contains('td-fallback')) return; e.preventDefault(); e.stopImmediatePropagation(); pendingTear = true; mainLoading(true); nearTool = true; loadTool(); }, true); })();
   var tool = $('#tool'), tstage = $('#tstage'), TD = null, toolLoaded = false, toolBuilt = false, nearTool = false, ETCH = null, pendingName = '';
   /* taken apart: a restrained brand set (graphite, steel, plaster, copper/peach, deep bronze); neighbours differ, labels name them */
   var FIN = { graphite: [0x3b3a3c, 0.42, 0.55], darksteel: [0x51565c, 0.3, 1.0], steel: [0xb9bec4, 0.3, 1.0], plaster: [0xd6c2a4, 0.72, 0.0], copper: [0xe8956a, 0.34, 1.0], bronze: [0x7e5232, 0.4, 1.0] };
@@ -1254,8 +1280,10 @@ button,input,select,textarea{font-family:inherit}
     var T = W.THREE;
     if (!T || !W.Teardown || !W.TDModels.clipper) return toolFail();
     var base = W.TDModels.clipper, tintParts = [], E = {};
-    function model(T, K, ctx) {
+    function* model(T, K, ctx) {
       var reg = base(T, K, ctx), gOf = {};
+      if (reg && typeof reg.next === 'function') reg = yield* reg;
+      yield 'w0';
       reg.groups.forEach(function (g) { if (DATA.tool[g.id]) g.caption = DATA.tool[g.id]; g.parts.forEach(function (p) { gOf[p] = g.id; }); });
       reg.captions.home = { name: 'Cave Studios', line: 'Every part of a good cut.', hint: 'Drag to turn. Tap a part.' };
       reg.captions.exploded = { name: 'Taken apart', line: 'Tap a part to see what it does.', hint: '' };
@@ -1269,7 +1297,9 @@ button,input,select,textarea{font-family:inherit}
         tintParts.push({ ob: p.object, rest: p.object.position.clone(), ms: ms, tint: mats[gOf[p.id]] || mats.body, on: false });
       });
       var dummy = new T.Mesh(new T.BoxGeometry(0.002, 0.002, 0.002), mats.blade); dummy.position.set(0, 0.8, 0); reg.root.add(dummy);
-      etchSetup(T, K, ctx, reg, E);
+      yield 'w1';
+      yield* etchSetup(T, K, ctx, reg, E);
+      yield 'w2';
       var of = reg.onFrame;
       reg.onFrame = function (now, dt, st) { if (of) of(now, dt, st); var b = tintFrame(), c = etchFrame(now, E); return b || c; };   /* dust drifts only while something else draws */
       return reg;
@@ -1282,34 +1312,45 @@ button,input,select,textarea{font-family:inherit}
       }
       return ch;
     }
+    /* the build runs in idle slices of a few ms (Teardown.createAsync): any scroll, touch, key or a playing video pauses it
+       until 300 ms of calm; the poster stays until the model, its shaders and the page's tint/laser shaders are ready */
+    var calmNow = function () { return performance.now() - lastInputT > 300 && !videoPlaying(); };
+    var opts = {
+      mount: tstage, model: model,
+      ui: { chips: $('#tchips'), caption: $('#tcap'), labels: $('#tlabels'), main: $('#tmain'), reset: $('#treset') },
+      insets: function () { return { top: 10, bottom: 10, left: 0, right: 0 }; },
+      ariaLabel: '3D illustration of a barber’s clipper. Drag sideways to turn it; tap a part to lift it out.',
+      exposure: 1.0, dprSmall: 1.5, dprMax: 2,
+      words: { teardown: 'Take it apart', release: 'Put it back', assemble: 'Put it together' },
+      onMode: function () { if (W.CAVE.sfx) W.CAVE.sfx('click'); },
+      budget: 8, canRun: calmNow,
+      prewarm: function* (api) {                                /* tint and laser shaders, one part per slice, without blocking */
+        if (!api.renderer || !api.scene) return;
+        tintParts.forEach(function (tp) { tp.ms.forEach(function (m) { m.o.material = tp.tint; }); });
+        if (E.fx) E.fx(true);
+        var back = function () { tintParts.forEach(function (tp) { tp.ms.forEach(function (m) { m.o.material = m.orig; }); }); if (E.fx) E.fx(false); };
+        if (!api.renderer.compileAsync) { try { api.renderer.compile(api.scene, api.camera); } catch (x) {} back(); return; }
+        var ps = [], kids = api.registry.root.children;
+        for (var i = 0; i < kids.length; i++) { ps.push(api.renderer.compileAsync(kids[i], api.camera, api.scene).catch(function () {})); yield; }
+        yield Promise.all(ps); back();
+      },
+      onReady: function (api) {
+        TD = api; W.CAVE.td = TD; TD.etch = E;
+        if (R.classList.contains('td-fallback')) return toolFail();
+        R.classList.remove('td-loading');
+        mainLoading(false);
+        if (pendingTear && TD.teardown) { pendingTear = false; TD.teardown(); }
+        if (pendingName) { var n = pendingName; pendingName = ''; startEtch(n); }
+      },
+      onFail: function () { toolFail(); }
+    };
     try {
-      TD = W.Teardown.create({
-        mount: tstage, model: model,
-        ui: { chips: $('#tchips'), caption: $('#tcap'), labels: $('#tlabels'), main: $('#tmain'), reset: $('#treset') },
-        insets: function () { return { top: 10, bottom: 10, left: 0, right: 0 }; },
-        ariaLabel: '3D illustration of a barber’s clipper. Drag sideways to turn it; tap a part to lift it out.',
-        exposure: 1.0, dprSmall: 1.5, dprMax: 2,
-        words: { teardown: 'Take it apart', release: 'Put it back', assemble: 'Put it together' },
-        onMode: function () { if (W.CAVE.sfx) W.CAVE.sfx('click'); }
-      });
-      W.CAVE.td = TD; TD.etch = E;
-      /* compile the tint and laser shaders now, behind the poster, so the first teardown and the first etch do not stall */
-      try {
-        if (TD.renderer && TD.scene) {
-          tintParts.forEach(function (tp) { tp.ms.forEach(function (m) { m.o.material = tp.tint; }); });
-          if (E.fx) E.fx(true);
-          TD.renderer.compile(TD.scene, TD.camera);
-          tintParts.forEach(function (tp) { tp.ms.forEach(function (m) { m.o.material = m.orig; }); });
-          if (E.fx) E.fx(false);
-        }
-      } catch (x) {}
-      if (R.classList.contains('td-fallback')) toolFail();
-      R.classList.remove('td-loading');
-      if (pendingName && !R.classList.contains('td-fallback')) { var n = pendingName; pendingName = ''; startEtch(n); }
+      if (W.Teardown.createAsync) W.Teardown.createAsync(opts);
+      else { var api0 = W.Teardown.create(opts); }
     } catch (x) { toolFail(); }
   }
   /* the name plate: a canvas texture wrapped on the body below the switch; letters are revealed by a laser sweep */
-  function etchSetup(T, K, ctx, reg, E) {
+  function* etchSetup(T, K, ctx, reg, E) {
     var lower = reg.parts.filter(function (p) { return p.id === 'lower'; })[0].object;
     lower.children.forEach(function (m) { if (m.material && m.material.alphaMap) m.visible = false; });   /* the model's own tiny CAVE decal */
     var R0 = 0.218, B0 = R0 * 0.88, PW = 0.30, PH = 0.12, CY = 0.455, cw = 1024, chh = 410;
@@ -1317,7 +1358,9 @@ button,input,select,textarea{font-family:inherit}
     var letters = cv(), mask = cv(), heat = cv(), lx = letters.getContext('2d'), mx = mask.getContext('2d'), hx = heat.getContext('2d');
     var maskT = new T.CanvasTexture(mask), heatT = new T.CanvasTexture(heat); heatT.colorSpace = T.SRGBColorSpace;
     var geo = new T.PlaneGeometry(PW, PH, 1, 1); geo.translate(0, CY, 0.0032);
-    geo = K.wrapOval(geo, R0, B0, 0, false, 0.012);
+    yield;
+    geo = yield* K.wrapOvalG(geo, R0, B0, 0, false, 0.012);
+    yield;
     var mat = K.std(ctx.env, { color: 0x9a938b, roughness: 0.7, metalness: 0.25, alphaMap: maskT, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, emissive: 0xffffff, emissiveMap: heatT, emissiveIntensity: 2.6 });
     var plate = new T.Mesh(geo, mat); plate.userData.etch = true; plate.renderOrder = 2;
     var off = lower.position.clone().negate(); plate.position.copy(off); lower.add(plate);
@@ -1335,6 +1378,7 @@ button,input,select,textarea{font-family:inherit}
       return [Math.max(0, cw / 2 - w / 2 - 6), Math.min(cw, cw / 2 + w / 2 + 6), fs];
     }
     function full() { mx.clearRect(0, 0, cw, chh); mx.drawImage(letters, 0, 0); hx.fillStyle = '#000'; hx.fillRect(0, 0, cw, chh); maskT.needsUpdate = true; heatT.needsUpdate = true; }
+    yield;
     paint('CAVE'); full();
     E.start = function (txt, delay) {
       var ext = paint(txt); mx.clearRect(0, 0, cw, chh); maskT.needsUpdate = true;
