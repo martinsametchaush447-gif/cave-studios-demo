@@ -1141,7 +1141,7 @@ details.cal summary{padding:0 14px}
     var h = (W.visualViewport ? W.visualViewport.height : W.innerHeight) || R.clientHeight, w = R.clientWidth;
     /* round 8: toolbar slides and the keyboard change only the height: return before any style or layout work.
        The stage is rebuilt only for a width change or a big height change with no field focused. */
-    if (!force && lockedH && measure.w === w && (Math.abs(h - lockedH) <= 120 || R.classList.contains('kb'))) return;
+    if (!force && lockedH && measure.w === w && (Math.abs(h - lockedH) <= h * 0.4 || R.classList.contains('kb'))) return;
     vw = w; lockedH = h; measure.w = w; vh = lockedH;
     R.style.setProperty('--svh', (vh / 100) + 'px');
     layout();
